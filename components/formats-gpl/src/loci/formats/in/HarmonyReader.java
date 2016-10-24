@@ -34,7 +34,6 @@ import java.util.HashSet;
 import loci.common.DataTools;
 import loci.common.Location;
 import loci.common.RandomAccessInputStream;
-import loci.common.xml.BaseHandler;
 import loci.common.xml.XMLTools;
 import loci.formats.CoreMetadata;
 import loci.formats.FormatException;
@@ -46,19 +45,12 @@ import loci.formats.meta.MetadataStore;
 import loci.formats.tiff.IFD;
 import loci.formats.tiff.TiffParser;
 
-import ome.units.UNITS;
 import ome.units.quantity.Length;
-import ome.units.quantity.Time;
 import ome.units.unit.Unit;
 import ome.xml.model.enums.AcquisitionMode;
-import ome.xml.model.enums.EnumerationException;
-import ome.xml.model.enums.UnitsLength;
 import ome.xml.model.primitives.NonNegativeInteger;
-import ome.xml.model.primitives.PositiveFloat;
 import ome.xml.model.primitives.PositiveInteger;
 import ome.xml.model.primitives.Timestamp;
-
-import org.xml.sax.Attributes;
 
 /**
  * HarmonyReader is the file format reader for PerkinElmer Harmony data.
@@ -75,7 +67,7 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
 
   // -- Fields --
 
-  private Plane[][] planes;
+  private HarmonyColumbusPlane[][] planes;
   private MinimalTiffReader reader;
   private ArrayList<String> metadataFiles = new ArrayList<String>();
   private String plateID;
@@ -178,9 +170,11 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
     ArrayList<String> files = new ArrayList<String>();
     files.addAll(metadataFiles);
     if (!noPixels) {
-      for (Plane[] well : planes) {
-        for (Plane p : well) {
-          files.add(p.filename);
+      for (HarmonyColumbusPlane[] well : planes) {
+        for (HarmonyColumbusPlane p : well) {
+          if (p != null && p.filename != null) {
+            files.add(p.filename);
+          }
         }
       }
     }
@@ -195,7 +189,7 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
     ArrayList<String> files = new ArrayList<String>();
     files.addAll(metadataFiles);
     if (!noPixels && getSeries() < planes.length) {
-      for (Plane p : planes[getSeries()]) {
+      for (HarmonyColumbusPlane p : planes[getSeries()]) {
         files.add(p.filename);
       }
     }
@@ -227,14 +221,18 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
   {
     FormatTools.checkPlaneParameters(this, no, buf.length, x, y, w, h);
 
-    if (getSeries() < planes.length && no < planes[getSeries()].length) {
-      Plane p = planes[getSeries()][no];
+    int seriesIndex = lookupSeriesIndex(getSeries());
+    LOGGER.trace("series = {}, seriesIndex = {}", getSeries(), seriesIndex);
+
+    if (seriesIndex < planes.length && no < planes[seriesIndex].length) {
+      HarmonyColumbusPlane p = planes[seriesIndex][no];
 
       if (new Location(p.filename).exists()) {
         if (reader == null) {
           reader = new MinimalTiffReader();
         }
         try {
+          LOGGER.debug("reading series = {}, no = {} from {}", getSeries(), no, p.filename);
           reader.setId(p.filename);
           reader.openBytes(0, buf, x, y, w, h);
         }
@@ -309,13 +307,13 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
 
     LOGGER.info("Parsing XML metadata");
     String xmlData = DataTools.readFile(id);
-    HarmonyHandler handler = new HarmonyHandler();
+    HarmonyColumbusHandler handler = new HarmonyColumbusHandler(currentId);
     XMLTools.parseXML(xmlData, handler);
 
     // sort the list of images by well and field indices
 
     LOGGER.info("Assembling plate dimensions");
-    ArrayList<Plane> planeList = handler.getPlanes();
+    ArrayList<HarmonyColumbusPlane> planeList = handler.getPlanes();
 
     HashSet<Integer> uniqueRows = new HashSet<Integer>();
     HashSet<Integer> uniqueCols = new HashSet<Integer>();
@@ -324,7 +322,7 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
     HashSet<Integer> uniqueTs = new HashSet<Integer>();
     HashSet<Integer> uniqueCs = new HashSet<Integer>();
 
-    for (Plane p : planeList) {
+    for (HarmonyColumbusPlane p : planeList) {
       uniqueRows.add(p.row);
       uniqueCols.add(p.col);
       uniqueFields.add(p.field);
@@ -350,7 +348,7 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
     int seriesCount = rows.length * cols.length * fields.length;
     core.clear();
 
-    planes = new Plane[seriesCount][zs.length * cs.length * ts.length];
+    planes = new HarmonyColumbusPlane[seriesCount][zs.length * cs.length * ts.length];
 
     int nextSeries = 0;
     for (int row=0; row<rows.length; row++) {
@@ -360,7 +358,7 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
           for (int t=0; t<ts.length; t++) {
             for (int z=0; z<zs.length; z++) {
               for (int c=0; c<cs.length; c++) {
-                for (Plane p : planeList) {
+                for (HarmonyColumbusPlane p : planeList) {
                   if (p.row == rows[row] && p.col == cols[col] &&
                     p.field == fields[field] && p.t == ts[t] && p.z == zs[z] &&
                     p.c == cs[c])
@@ -440,12 +438,20 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
     for (int row=0; row<rows.length; row++) {
       for (int col=0; col<cols.length; col++) {
         int well = row * cols.length + col;
+        LOGGER.debug("Populating well row = {}, col = {}, well = {}", row, col, well);
         store.setWellID(MetadataTools.createLSID("Well", 0, well), 0, well);
         store.setWellRow(new NonNegativeInteger(rows[row]), 0, well);
         store.setWellColumn(new NonNegativeInteger(cols[col]), 0, well);
 
         for (int field=0; field<fields.length; field++) {
           int planesIndex = well * fields.length + field;
+          LOGGER.debug("Populating field = {}, index = {}", field, planesIndex);
+
+          if (planes[planesIndex][0] == null) {
+            // variable number of fields; the field was not acquired in this well
+            continue;
+          }
+
           int imageIndex = planes[planesIndex][0].image;
           if (imageIndex == -1) {
             continue;
@@ -477,6 +483,9 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
       store.setExperimenterLastName(handler.getExperimenterName(), 0);
 
       for (int i=0; i<getSeriesCount(); i++) {
+        if (planes[i][0] == null) {
+          continue;
+        }
         store.setImageExperimenterRef(experimenterID, i);
         if (planes[i][0].acqTime != null) {
           store.setImageAcquisitionDate(new Timestamp(planes[i][0].acqTime), i);
@@ -518,298 +527,18 @@ public class HarmonyReader extends FormatReader implements IHCSReader {
     }
   }
 
-  // -- Helper classes --
-
-  class HarmonyHandler extends BaseHandler {
-    private static final String ROOT_ELEMENT = "EvaluationInputData";
-
-    // -- Fields --
-
-    private String currentName;
-    private Plane activePlane;
-    private String currentUnit;
-
-    private String displayName;
-    private String plateID;
-    private String measurementTime;
-    private String plateName;
-    private String plateDescription;
-    private int plateRows, plateCols;
-    private ArrayList<Plane> planes = new ArrayList<Plane>();
-
-    private StringBuffer currentValue = new StringBuffer();
-
-    private ArrayList<String> elementNames = new ArrayList<String>();
-
-    private HashMap<String, String> metadata = new HashMap<String, String>();
-    private HashMap<String, Integer> keyCounter = new HashMap<String, Integer>();
-
-    // -- HarmonyHandler API methods --
-
-    public HashMap<String, String> getMetadataMap() {
-      return metadata;
-    }
-
-    public ArrayList<Plane> getPlanes() {
-      return planes;
-    }
-
-    public String getExperimenterName() {
-      return displayName;
-    }
-
-    public String getPlateIdentifier() {
-      return plateID;
-    }
-
-    public String getMeasurementTime() {
-      return measurementTime;
-    }
-
-    public String getPlateName() {
-      return plateName;
-    }
-
-    public String getPlateDescription() {
-      return plateDescription;
-    }
-
-    public int getPlateRows() {
-      return plateRows;
-    }
-
-    public int getPlateColumns() {
-      return plateCols;
-    }
-
-    // -- DefaultHandler API methods --
-
-    @Override
-    public void characters(char[] ch, int start, int length) {
-      String value = new String(ch, start, length);
-      currentValue.append(value);
-    }
-
-    @Override
-    public void startElement(String uri, String localName, String qName,
-      Attributes attributes)
-    {
-      if (!qName.equals(ROOT_ELEMENT)) {
-        elementNames.add(qName);
+  private int lookupSeriesIndex(int seriesIndex) {
+    int index = 0;
+    for (int i=0; i<planes.length; i++) {
+      if (planes[i][0] == null) {
+        continue;
       }
-      currentValue.setLength(0);
-
-      if (qName.equals("Image") && attributes.getValue("id") == null) {
-        activePlane = new Plane();
+      if (index == seriesIndex) {
+        return i;
       }
-
-      currentUnit = attributes.getValue("Unit");
+      index++;
     }
-
-    @Override
-    public void endElement(String uri, String localName, String qName) {
-      String value = currentValue.toString();
-
-      int elementCount = elementNames.size();
-      String currentName = null;
-      if (elementCount > 0) {
-        currentName = elementNames.get(elementCount - 1);
-      }
-      String parentName = null;
-      if (elementCount > 1) {
-        parentName = elementNames.get(elementCount - 2);
-      }
-
-      if (parentName == null) {
-        metadata.put(currentName, value);
-      }
-      else {
-        int keyCount = 1;
-        if (keyCounter.containsKey(parentName)) {
-          keyCount = keyCounter.get(parentName);
-        }
-
-        metadata.put(parentName + " #" + keyCount + " " + currentName, value);
-      }
-
-      if (keyCounter.containsKey(currentName) || elementNames.size() == 2) {
-        int keyCount = 1;
-        if (keyCounter.containsKey(currentName)) {
-          keyCount = keyCounter.get(currentName);
-        }
-        keyCounter.put(currentName, keyCount + 1);
-      }
-
-      if ("Plate".equals(parentName)) {
-        if ("Name".equals(currentName)) {
-          plateName = value;
-        }
-        else if ("PlateTypeName".equals(currentName)) {
-          plateDescription = value;
-        }
-        else if ("PlateRows".equals(currentName)) {
-          plateRows = Integer.parseInt(value);
-        }
-        else if ("PlateColumns".equals(currentName)) {
-          plateCols = Integer.parseInt(value);
-        }
-        else if ("PlateID".equals(currentName)) {
-          plateID = value;
-        }
-        else if ("MeasurementStartTime".equals(currentName)) {
-          measurementTime = value;
-        }
-      }
-
-      if ("User".equals(currentName)) {
-        displayName = value;
-      }
-      else if (activePlane != null && "Image".equals(parentName)) {
-        if ("URL".equals(currentName)) {
-          if (value.startsWith("http")) {
-            activePlane.filename = value;
-          }
-          else {
-            Location parent =
-              new Location(currentId).getAbsoluteFile().getParentFile();
-            activePlane.filename = new Location(parent, value).getAbsolutePath();
-          }
-        }
-        else if ("Row".equals(currentName)) {
-          activePlane.row = Integer.parseInt(value) - 1;
-        }
-        else if ("Col".equals(currentName)) {
-          activePlane.col = Integer.parseInt(value) - 1;
-        }
-        else if ("FieldID".equals(currentName)) {
-          activePlane.field = Integer.parseInt(value);
-        }
-        else if ("PlaneID".equals(currentName)) {
-          activePlane.z = Integer.parseInt(value);
-        }
-        else if ("ImageSizeX".equals(currentName)) {
-          activePlane.x = Integer.parseInt(value);
-        }
-        else if ("ImageSizeY".equals(currentName)) {
-          activePlane.y = Integer.parseInt(value);
-        }
-        else if ("TimepointID".equals(currentName)) {
-          activePlane.t = Integer.parseInt(value);
-        }
-        else if ("ChannelID".equals(currentName)) {
-          activePlane.c = Integer.parseInt(value);
-        }
-        else if ("ChannelName".equals(currentName)) {
-          activePlane.channelName = value;
-        }
-        else if ("ImageResolutionX".equals(currentName)) {
-          activePlane.resolutionX =
-            FormatTools.getPhysicalSizeX(Double.parseDouble(value), currentUnit);
-        }
-        else if ("ImageResolutionY".equals(currentName)) {
-          activePlane.resolutionY =
-            FormatTools.getPhysicalSizeY(Double.parseDouble(value), currentUnit);
-        }
-        else if ("PositionX".equals(currentName)) {
-          final double x = Double.parseDouble(value);
-          try {
-            UnitsLength ul = UnitsLength.fromString(currentUnit);
-            activePlane.positionX = UnitsLength.create(x, ul);
-          }
-          catch (EnumerationException e) {
-            LOGGER.debug("Could not parse unit '{}'", currentUnit);
-          }
-        }
-        else if ("PositionY".equals(currentName)) {
-          final double y = Double.parseDouble(value);
-          try {
-            UnitsLength ul = UnitsLength.fromString(currentUnit);
-            activePlane.positionY = UnitsLength.create(y, ul);
-          }
-          catch (EnumerationException e) {
-            LOGGER.debug("Could not parse unit '{}'", currentUnit);
-          }
-        }
-        else if ("PositionZ".equals(currentName)) {
-          final double z = Double.parseDouble(value);
-          try {
-            UnitsLength ul = UnitsLength.fromString(currentUnit);
-            activePlane.positionZ = UnitsLength.create(z, ul);
-          }
-          catch (EnumerationException e) {
-            LOGGER.debug("Could not parse unit '{}'", currentUnit);
-          }
-        }
-        else if ("MeasurementTimeOffset".equals(currentName)) {
-          final double t = Double.parseDouble(value);
-          activePlane.deltaT = FormatTools.getTime(t, currentUnit);
-        }
-        else if ("ObjectiveMagnification".equals(currentName)) {
-          activePlane.magnification = Double.parseDouble(value);
-        }
-        else if ("ObjectiveNA".equals(currentName)) {
-          activePlane.lensNA = Double.parseDouble(value);
-        }
-        else if ("MainEmissionWavelength".equals(currentName)) {
-          final double wave = Double.parseDouble(value);
-          if (wave > 0) {
-            activePlane.emWavelength = FormatTools.getWavelength(wave, currentUnit);
-          }
-        }
-        else if ("MainExcitationWavelength".equals(currentName)) {
-          final double wave = Double.parseDouble(value);
-          if (wave > 0) {
-            activePlane.exWavelength = FormatTools.getWavelength(wave, currentUnit);
-          }
-        }
-        else if ("AcquisitionType".equals(currentName)) {
-          activePlane.acqType = value;
-        }
-        else if ("ChannelType".equals(currentName)) {
-          activePlane.channelType = value;
-        }
-        else if ("AbsTime".equals(currentName)) {
-          activePlane.acqTime = value;
-        }
-      }
-
-      if (qName.equals("Image") && activePlane != null) {
-        planes.add(activePlane);
-      }
-
-      if (!qName.equals(ROOT_ELEMENT)) {
-        elementNames.remove(elementNames.size() - 1);
-      }
-      currentUnit = null;
-    }
-
-  }
-
-  class Plane {
-    public String filename;
-    public int row;
-    public int col;
-    public int field;
-    public int image = -1;
-    public int x;
-    public int y;
-    public int z;
-    public int t;
-    public int c;
-    public String channelName;
-    public Length resolutionX;
-    public Length resolutionY;
-    public Length positionX;
-    public Length positionY;
-    public Length positionZ;
-    public Time deltaT;
-    public Length emWavelength;
-    public Length exWavelength;
-    public double magnification;
-    public double lensNA;
-    public String acqType;
-    public String channelType;
-    public String acqTime;
+    return -1;
   }
 
   @Override
